@@ -16,11 +16,7 @@ keep working.
 
 - Provider id: `opencode-zen-free` (display name **OpenCode Zen Free**)
 - Package / bundle / service: `dsh-opencode-zen-plugin`
-- Works on DSH `0.2.1-alpha.5` through `0.2.1-rc.2` (web + headless profiles)
-- Mounting never touches the network: the user agent and model list come from
-  the on-disk catalog cache, and the live refresh runs behind the boot — a
-  slow or blocked feed can delay the *model picker filling in*, never the
-  harness starting
+- Works on DSH `0.2.1-rc.2` (web + headless profiles)
 - Zero-cost models are discovered live from the Zen catalog + [models.dev](https://models.dev)
   metadata (free = zero cost or a `-free` model id), with a disk cache
 - Streams text and reasoning, supports tool calling, images (on capable models),
@@ -37,8 +33,8 @@ headless runs (plain Q&A and tool use — a model reading a file through the
 
 ## Requirements
 
-- DeepSeek Harness `0.2.1-alpha.5` … `0.2.1-rc.2` (the plugin declares
-  `dsh.compatibility.dsh: ">=0.2.1-alpha.5 <0.3"`)
+- DeepSeek Harness `0.2.1-rc.2` (the plugin declares
+  `dsh.compatibility.dsh: ">=0.2.1-rc.2 <0.3"`)
 - Node.js 20+ and a profile you can edit (`$DSH_HOME/profiles/<profile>`)
 - **No API key.** Anonymous free-tier access works out of the box. Network
   access to `opencode.ai` and `models.dev` is required on first boot (the model
