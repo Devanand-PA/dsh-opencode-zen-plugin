@@ -34,11 +34,18 @@ headless runs (plain Q&A and tool use — a model reading a file through the
 ## Requirements
 
 - DeepSeek Harness `0.2.1-rc.2` (the plugin declares
-  `dsh.compatibility.dsh: ">=0.2.1-rc.2 <0.3"`)
+  `dsh.compatibility.dsh: ">=0.2.1-rc.2 <0.3"`, which deliberately **excludes
+  alpha builds** — on any other DSH version the loader prints a one-line
+  "skipping profile bundle" notice and boots without the plugin; the harness
+  is never touched)
 - Node.js 20+ and a profile you can edit (`$DSH_HOME/profiles/<profile>`)
-- **No API key.** Anonymous free-tier access works out of the box. Network
-  access to `opencode.ai` and `models.dev` is required on first boot (the model
-  catalog is cached afterwards).
+- **No API key.** Anonymous free-tier access works out of the box.
+- **The mount never blocks and never waits on the network.** `apply()` is
+  synchronous: the picker immediately serves the 11 zero-cost models built
+  into pi-ai (plus the last-good catalog from disk), and the live catalog is
+  refreshed lazily in the background (right after mount, on model reads, and
+  a slow daily round). A slow or blocked route to `opencode.ai`/`models.dev`
+  slows only the refresh, never the harness boot or a session.
 
 ## Install
 
@@ -148,8 +155,8 @@ logging proxy and bisecting (details in
 All are satisfied by this plugin automatically:
 
 1. `Authorization: Bearer public` (a real key also works)
-2. `User-Agent: opencode/<semver>` with semver ≳ 1.11 (the plugin resolves the
-   current OpenCode version at boot and falls back to a known-good floor)
+2. `User-Agent: opencode/<semver>` with semver ≳ 1.11 (the plugin pins a
+   known-good version — no version probe, no network at boot)
 3. `x-opencode-session` / `x-opencode-session-id` / `x-session-affinity` /
    `x-session-id`: one `ses_…` id (26 base62/hex chars) per DSH session,
    minted in OpenCode's id format and reused for cache friendliness
@@ -180,12 +187,17 @@ Model availability:
   OpenCode CLI. If you're routing Zen through a custom proxy, set
   `DSH_ZEN_BASE_URL` (e.g. `http://127.0.0.1:8899/v1`); the plugin patches the
   UA for that host too.
-- **426 Upgrade Required** — the resolved OpenCode version is too old; the
-  plugin already enforces a ≥1.18 floor, so this means OpenCode raised the bar
-  again — update the plugin.
-- **Model missing from the picker** — the catalog cache may be stale; it
-  refreshes on boot (and on settings changes). Delete
-  `$DSH_HOME/cache/opencode-zen-free-catalog.json` to force a refresh.
+- **426 Upgrade Required** — OpenCode raised its version floor past the
+  plugin's pinned `opencode/1.19.3`; update the plugin (or file an issue).
+- **Model missing from the picker** — the picker serves pi-ai's builtin
+  zero-cost OpenCode models offline; the live catalog (a few more models,
+  including the `muse-spark-*` responses ones) arrives with the background
+  refresh. To force it, delete
+  `$DSH_HOME/cache/dsh-opencode-zen-plugin-catalog.json` (the older
+  `opencode-zen-free-catalog.json` is read and upgraded automatically).
+- **DSH 0.2.1-alpha.* prints "skipping profile bundle"** — intentional. The
+  plugin is compatible with `0.2.1-rc.2` only; alpha builds are excluded so
+  they can never be affected by it.
 
 ## Credits
 

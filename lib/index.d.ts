@@ -17,8 +17,11 @@
  *
  * The plugin therefore wraps pi-ai's OpenAI transports with the identity
  * headers, pads the tool list when the harness sends fewer tools than the
- * gate wants (compaction, titles, restricted turns), and scans the model
- * catalog at mount so selectors see the models before the first turn.
+ * gate wants (compaction, titles, restricted turns), and keeps the model
+ * catalog fresh without ever blocking the mount: apply() is synchronous, the
+ * picker starts on pi-ai's builtin zero-cost OpenCode models (plus the
+ * last-good list on disk), and the live catalog is refreshed lazily in the
+ * background.
  *
  * Structure and several hard-won details follow the proven approach of
  * github.com/jiesou/dsh-opencode-zen-free-provider (MIT).
@@ -48,5 +51,5 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
 }>>, "plain">;
 type LiveConfig = Schemastery.TypeT<typeof Config>;
 export declare const requiredZenTools: (tools?: readonly Tool[]) => Tool[];
-export declare function apply(ctx: Context, config: LiveConfig): Promise<void>;
+export declare function apply(ctx: Context, config: LiveConfig): void;
 export {};

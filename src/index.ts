@@ -17,21 +17,24 @@
  *
  * The plugin therefore wraps pi-ai's OpenAI transports with the identity
  * headers, pads the tool list when the harness sends fewer tools than the
- * gate wants (compaction, titles, restricted turns), and scans the model
- * catalog at mount so selectors see the models before the first turn.
+ * gate wants (compaction, titles, restricted turns), and keeps the model
+ * catalog fresh without ever blocking the mount: apply() is synchronous, the
+ * picker starts on pi-ai's builtin zero-cost OpenCode models (plus the
+ * last-good list on disk), and the live catalog is refreshed lazily in the
+ * background.
  *
  * Structure and several hard-won details follow the proven approach of
  * github.com/jiesou/dsh-opencode-zen-free-provider (MIT).
  */
 import type { Context } from '@deepseek-ai/cordis'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, rename, writeFile } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { assertUsableApiKey, errorChain, resolveRetryPolicy, RetryPolicySchema } from '@deepseek-ai/dsh-llm'
 import type { RetryPolicyConfig } from '@deepseek-ai/dsh-llm'
 import { PiAiAdapter, type ResolvedPiAiProviderProfile } from '@deepseek-ai/dsh-llm-pi-ai'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import { deepEqualJson } from '@deepseek-ai/dsh-util-values'
 // Augments Context with `fiber.entry` and the `loader/volatile-update` event.
 import type {} from '@deepseek-ai/cordis-plugin-loader'
 import z from '@deepseek-ai/schemastery'
@@ -89,12 +92,12 @@ const CONTEXT_WINDOW_OVERRIDES: Record<string, number> = {
 }
 
 /**
- * Latest CLI version, read off unpkg's `@latest` redirect. The endpoint
- * refuses versions below ~1.11 with 426 "upgrade required", so an unreachable
- * unpkg must not silently drop below the known-good floor.
+ * The wire identity, pinned. The gate demands `opencode/<semver>` with a
+ * semver above ~1.11 and refuses older ones with 426; this constant is a
+ * known-good version, so the wire identity needs no network at any point of
+ * the plugin's life. When OpenCode raises the bar, bump this string.
  */
-const OPENCODE_VERSION_URL = 'https://unpkg.com/opencode-ai@latest/package.json'
-const OPENCODE_VERSION_FALLBACK = '1.19.3'
+const ZEN_USER_AGENT = 'opencode/1.19.3'
 
 /** Envelope types that must stay AUTH-classified instead of being rewritten. */
 const AUTH_ERROR_TYPES = new Set(['AuthError', 'authentication_error', 'invalid_api_key', 'unauthorized'])
@@ -141,29 +144,6 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
 //#region OpenCode identity
-
-/** Semver compare, enough for a version floor check. */
-const semverAtLeast = (version: string, floor: readonly number[]): boolean => {
-  const parts = version.split('.').map(part => Number.parseInt(part, 10))
-  if (parts.length < floor.length || parts.some(part => !Number.isFinite(part))) return false
-  for (let index = 0; index < floor.length; index += 1) {
-    const part = parts[index]!
-    const bound = floor[index]!
-    if (part !== bound) return part > bound
-  }
-  return true
-}
-
-const resolveOpenCodeVersion = async (): Promise<string> => {
-  try {
-    const payload = await fetchJson(OPENCODE_VERSION_URL, { accept: 'application/json' })
-    const version = typeof payload.version === 'string' ? payload.version : ''
-    if (version.length > 0 && semverAtLeast(version, [1, 18])) return version
-  } catch {
-    // unpkg unreachable: fall through to the pinned floor.
-  }
-  return OPENCODE_VERSION_FALLBACK
-}
 
 /**
  * Identifier format of the opencode CLI (`packages/schema/src/identifier.ts`):
@@ -257,7 +237,11 @@ const zenApiHeaders = (model: Pick<Model<ZenApi>, 'headers'>, options: SimpleStr
  * URL keeps the harness attribution untouched.
  */
 const zenNativeFetch = globalThis.fetch
-let zenUserAgent: string | undefined
+/** The wire identity the transport stamps onto every opencode.ai request. */
+const zenUserAgent = ZEN_USER_AGENT
+
+/** Minimum spacing between fire-and-forget catalog refreshes. */
+const REFRESH_DEBOUNCE_MS = 60_000
 
 const ZEN_URL_MARKERS = [
   'opencode.ai/inference',
@@ -579,18 +563,33 @@ function buildModels(
 const CACHE_DIR = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'cache')
 const CACHE_PATH = join(CACHE_DIR, `${name}-catalog.json`)
 
+/** Last-good live catalog on disk, so a cold cache never blanks the picker. */
 interface CatalogCache {
-  zen: unknown[]
-  models: Record<string, unknown>
-  userAgent: string
+  models: Model<ZenApi>[]
+  checkedAt: number
 }
 
-async function readCatalogCache(): Promise<CatalogCache | undefined> {
+function readCatalogCache(): CatalogCache | undefined {
   try {
-    const parsed: unknown = JSON.parse(await readFile(CACHE_PATH, 'utf8'))
-    if (!isRecord(parsed) || !Array.isArray(parsed.zen) || !isRecord(parsed.models)) return undefined
-    if (typeof parsed.userAgent !== 'string') return undefined
-    return { zen: parsed.zen, models: parsed.models, userAgent: parsed.userAgent }
+    const parsed: unknown = JSON.parse(readFileSync(CACHE_PATH, 'utf8'))
+    if (!isRecord(parsed)) return undefined
+    // Current format: the built model list, straight from the last publish.
+    if (Array.isArray(parsed.models)) {
+      const models = parsed.models.filter((model): model is Model<ZenApi> =>
+        isRecord(model) && (model as Record<string, unknown>).provider === PROVIDER &&
+        typeof (model as Record<string, unknown>).id === 'string')
+      if (models.length > 0) {
+        return { models, checkedAt: typeof parsed.checkedAt === 'number' ? parsed.checkedAt : 0 }
+      }
+    }
+    // First format: the raw zen + models.dev feeds. Rebuild the list from
+    // them (pure, no network) so an install that upgrades mid-flight keeps
+    // serving exactly the models it had before.
+    if (Array.isArray(parsed.zen) && isRecord(parsed.models)) {
+      const rebuilt = buildModels(parsed.zen, parsed.models, ZEN_USER_AGENT)
+      if (rebuilt.length > 0) return { models: rebuilt, checkedAt: 0 }
+    }
+    return undefined
   } catch {
     return undefined
   }
@@ -607,7 +606,6 @@ async function writeCatalogCache(cache: CatalogCache): Promise<void> {
     // A cache miss is always recoverable; never fail the scan over it.
   }
 }
-//#endregion
 
 // Required by the adapter, unused by this route: the credential comes from
 // `resolveApiKey`, so pi-ai never stores one nor asks an ambient question.
@@ -621,34 +619,109 @@ const PI_AUTH: { credentials: CredentialStore, authContext: AuthContext } = {
   authContext: { env: async () => undefined, fileExists: async () => false },
 }
 
-export async function apply(ctx: Context, config: LiveConfig): Promise<void> {
-  // One-time: the Zen user-agent the transport forces on every opencode.ai request.
-  const opencodeVersion = await resolveOpenCodeVersion()
-  const opencodeUserAgent = `opencode/${opencodeVersion}`
-  zenUserAgent = opencodeUserAgent
+export function apply(ctx: Context, config: LiveConfig): void {
+  // The mount path is strictly synchronous and touches no network. The
+  // harness starts listening (and accepts sessions, model resolutions, and
+  // shutdown) without waiting on any fetch this plugin could make; the live
+  // catalog arrives in the background. Before that first refresh lands, the
+  // picker serves pi-ai's builtin zero-cost OpenCode models, or the last-good
+  // list on disk when one exists.
 
   // The Loader owns the settings namespace, so the configuration form is
   // addressed by the profile entry id that mounted this plugin.
   const settingsNs = ctx.fiber.entry?.options.id ?? name
 
-  // Outside the settings-backed config, so a settings snapshot cannot clobber
-  // a scan.
-  let scanned: Model<ZenApi>[] = []
+  // Offline floor: pi-ai ships the OpenCode catalog; its zero-cost entries
+  // are what the picker offers before any refresh, always.
+  const floor = builtinFloor()
+
+  // Last-good live list from a previous run, if one was written.
+  const cached = readCatalogCache()
+
+  const provider = createProvider<ZenApi>({
+    id: PROVIDER,
+    name: 'OpenCodeZenFree',
+    baseUrl: ZEN_BASE_URL,
+    auth: { apiKey: { name: 'OpenCodeZenFree', resolve: ({ credential }) => Promise.resolve({
+      auth: credential?.key === undefined ? {} : { apiKey: credential.key },
+      source: 'OpenCodeZenFree',
+    }) } },
+    models: floor,
+    api: zenApi,
+    // The live overlay: the Zen feed (which model ids exist) crossed with
+    // models.dev (which of those are free). Bounded; on failure the previous
+    // list stands and the floor keeps the picker alive.
+    fetchModels: async () => {
+      const [zen, modelsDev] = await Promise.all([
+        fetchJson(ZEN_CATALOG_URL, { 'User-Agent': ZEN_USER_AGENT, accept: 'application/json' }),
+        fetchJson('https://models.dev/api.json', { accept: 'application/json' }),
+      ])
+      if (!Array.isArray(zen.data)) throw new Error('zen models: unexpected response shape')
+      if (!isRecord(modelsDev.opencode) || !isRecord(modelsDev.opencode.models)) {
+        throw new Error('models.dev: no "opencode" provider')
+      }
+      const next = buildModels(zen.data, modelsDev.opencode.models, ZEN_USER_AGENT)
+      if (next.length === 0) throw new Error('no OpenCode Zen free models resolved')
+      return next
+    },
+  })
+
+  // Fire-and-forget refreshes, debounced: the first one runs right after the
+  // mount returns, every read of the model list is another opportunity, and a
+  // long-lived instance gets a slow daily round. `refreshModels` restores the
+  // disk cache before the network attempt, so a warm start serves the last
+  // good list within a tick of mount.
+  let lastRefresh = 0
+  let refreshing = false
+  let loggedSync = false
+  const refresh = (force = false): void => {
+    if (refreshing) return
+    if (!force && Date.now() - lastRefresh < REFRESH_DEBOUNCE_MS) return
+    refreshing = true
+    type RefreshCall = Parameters<NonNullable<typeof provider.refreshModels>>[0]
+    const call: RefreshCall = {
+      stored: cached === undefined ? undefined : { models: cached.models, checkedAt: cached.checkedAt },
+      publish: async ({ update, persist }) => {
+        update?.()
+        lastRefresh = Date.now()
+        if (persist) {
+          const models = persist.models.filter((model): model is Model<ZenApi> =>
+            isRecord(model) && (model as Record<string, unknown>).provider === PROVIDER &&
+            typeof (model as Record<string, unknown>).id === 'string')
+          if (models.length > 0) void writeCatalogCache({ models, checkedAt: persist.checkedAt ?? Date.now() })
+        }
+        return true
+      },
+      allowNetwork: true,
+      signal: new AbortController().signal,
+    }
+    provider.refreshModels?.(call)
+      .then(() => {
+        refreshing = false
+        if (!loggedSync) {
+          loggedSync = true
+          ctx.logger.info('[%s] catalog: %d free model(s) live', name, provider.getModels().length)
+        }
+      })
+      .catch((error: unknown) => {
+        refreshing = false
+        ctx.logger.warn('[%s] catalog refresh failed: %s', name, errorChain(error))
+      })
+  }
+
+  // Every read of the model list is also a refresh opportunity: the picker, a
+  // session's model resolution, and the settings page all read here.
+  const liveProvider = {
+    ...provider,
+    getModels: () => {
+      refresh()
+      return provider.getModels()
+    },
+  }
 
   const buildProfiles = (): ReadonlyMap<string, ResolvedPiAiProviderProfile> => {
     const opts = liveConfig(config)
-    const piProvider = createProvider<ZenApi>({
-      id: PROVIDER,
-      name: 'OpenCodeZenFree',
-      baseUrl: ZEN_BASE_URL,
-      auth: { apiKey: { name: 'OpenCodeZenFree', resolve: ({ credential }) => Promise.resolve({
-        auth: credential?.key === undefined ? {} : { apiKey: credential.key },
-        source: 'OpenCodeZenFree',
-      }) } },
-      models: scanned,
-      api: zenApi,
-    })
-    const profiles = new Map<string, ResolvedPiAiProviderProfile>([[PROVIDER, {
+    return new Map<string, ResolvedPiAiProviderProfile>([[PROVIDER, {
       provider: PROVIDER,
       displayName: DISPLAY_NAME,
       apiKeyEnv: credentialRef('OPENCODE_ZEN_FREE_API_KEY'),
@@ -657,16 +730,15 @@ export async function apply(ctx: Context, config: LiveConfig): Promise<void> {
       requestImagePixelBudget: 4_194_304,
       requestImageMaxBytes: opts.requestImageMaxBytes ?? DEFAULT_REQUEST_IMAGE_MAX_BYTES,
       retryPolicy: resolveRetryPolicy(opts.retryPolicy, `${name}: retryPolicy`),
-      piProvider: piProvider as any,
+      piProvider: liveProvider as unknown as ResolvedPiAiProviderProfile['piProvider'],
       modelErrors: new Map(),
       configuredMaxTokens: new Map(),
     }]])
-    return profiles
   }
 
-  // PiAiAdapter memoizes its snapshot on this Map's identity, so a fresh Map
-  // per request would rebuild the whole pi-ai collection: rebuild only on
-  // change.
+  // PiAiAdapter memoizes its snapshot on this Map's identity: the map is
+  // rebuilt only when the settings change, never per read, so the live model
+  // list flows through the provider's own getModels instead.
   let profiles = buildProfiles()
 
   const adapter = new PiAiAdapter({
@@ -690,53 +762,35 @@ export async function apply(ctx: Context, config: LiveConfig): Promise<void> {
   ctx.llm.registerAdapter([PROVIDER], adapter)
 
   // Every field is volatile, so the Loader commits a settings write into this
-  // fiber and announces it here instead of remounting; re-derive the profiles.
+  // fiber and announces it here instead of remounting; re-derive the profile
+  // wrapper only (the provider, and its live list, are untouched).
   ctx.on('loader/volatile-update', () => {
     profiles = buildProfiles()
   })
 
-  // The catalog is fetched once at mount. Mount awaits it: dsh resolves a
-  // session's model as soon as the provider is up, so registering the adapter
-  // against an empty catalogue makes every model read as UNKNOWN_MODEL on the
-  // first turn — the scan has to land before the first resolve does. Both
-  // feeds are bounded, and when either is unreachable the last-good catalog
-  // on disk stands in.
-  async function sync(): Promise<void> {
-    const usable = (zen: unknown[], models: Record<string, unknown>, userAgent: string) => {
-      const next = buildModels(zen, models, userAgent)
-      if (next.length === 0) throw new Error('no OpenCode Zen free models resolved')
-      return next
-    }
-
-    let next: Model<ZenApi>[]
-    try {
-      const [zen, modelsDev] = await Promise.all([
-        fetchJson(ZEN_CATALOG_URL, {
-          'User-Agent': opencodeUserAgent,
-          accept: 'application/json',
-        }),
-        fetchJson('https://models.dev/api.json', { accept: 'application/json' }),
-      ])
-      if (!Array.isArray(zen.data)) throw new Error('zen models: unexpected response shape')
-      if (!isRecord(modelsDev.opencode) || !isRecord(modelsDev.opencode.models)) {
-        throw new Error('models.dev: no "opencode" provider')
-      }
-      next = usable(zen.data, modelsDev.opencode.models, opencodeUserAgent)
-      void writeCatalogCache({ zen: zen.data, models: modelsDev.opencode.models, userAgent: opencodeUserAgent })
-    } catch (error) {
-      const cached = await readCatalogCache()
-      if (cached === undefined) throw error
-      ctx.logger.warn('[%s] catalog fetch failed (%s); using the cached catalog', name, errorChain(error))
-      next = usable(cached.zen, cached.models, cached.userAgent)
-    }
-
-    if (deepEqualJson(next, scanned)) return
-    scanned = next
-    profiles = buildProfiles()
-    ctx.logger.info('[%s] synced %d free model(s): %s', name, scanned.length, scanned.map(model => model.id).join(', '))
-  }
-
-  await sync().catch((error: unknown) => {
-    ctx.logger.warn('[%s] initial catalog scan failed: %s', name, errorChain(error))
-  })
+  setImmediate(() => refresh(true))
+  const dailyRefresh = setInterval(() => refresh(true), 6 * 60 * 60_000)
+  dailyRefresh.unref?.()
 }
+
+//#region Offline floor
+
+/**
+ * The plugin's offline floor: the zero-cost entries of pi-ai's builtin
+ * OpenCode catalog. Available the instant apply() returns, with no network
+ * and no disk, so the picker and the first model resolution work even while
+ * the live catalog is unreachable. The live refresh overlays (and shadows)
+ * these by id once it lands.
+ */
+function builtinFloor(): Model<ZenApi>[] {
+  return getBuiltinModels('opencode')
+    .filter(model =>
+      (model.api === 'openai-completions' || model.api === 'openai-responses') &&
+      Object.values(model.cost ?? {}).every(cost => cost === 0))
+    .map(model => ({
+      ...model,
+      provider: PROVIDER,
+      baseUrl: ZEN_BASE_URL,
+    })) as Model<ZenApi>[]
+}
+//#endregion
