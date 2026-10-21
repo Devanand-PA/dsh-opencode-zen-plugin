@@ -156,7 +156,11 @@ const semverAtLeast = (version: string, floor: readonly number[]): boolean => {
 
 const resolveOpenCodeVersion = async (): Promise<string> => {
   try {
-    const payload = await fetchJson(OPENCODE_VERSION_URL, { accept: 'application/json' })
+    const payload = await fetchJson(OPENCODE_VERSION_URL, { accept: 'application/json' }, {
+      attempts: 1,
+      timeoutMs: VERSION_TIMEOUT_MS,
+      budgetMs: VERSION_TIMEOUT_MS,
+    })
     const version = typeof payload.version === 'string' ? payload.version : ''
     if (version.length > 0 && semverAtLeast(version, [1, 18])) return version
   } catch {
@@ -438,18 +442,30 @@ const CATALOG_ATTEMPTS = 3
 const CATALOG_TIMEOUT_MS = 20_000
 const CATALOG_TOTAL_BUDGET_MS = 45_000
 
+/** One attempt, short: the version fetch runs in the boot's background. */
+const VERSION_TIMEOUT_MS = 5_000
+/** The cold-cache boot grace window: how long the first boot may wait for the
+ *  catalog scan before continuing without it (the scan keeps running). */
+const FIRST_BOOT_GRACE_MS = 10_000
+
 const sleep = (ms: number) => new Promise<void>(resolve => { setTimeout(resolve, ms) })
 
-async function fetchJson(url: string, headers: Record<string, string>): Promise<Record<string, unknown>> {
-  const deadline = Date.now() + CATALOG_TOTAL_BUDGET_MS
+async function fetchJson(
+  url: string,
+  headers: Record<string, string>,
+  opts: { attempts?: number, timeoutMs?: number, budgetMs?: number } = {},
+): Promise<Record<string, unknown>> {
+  const attempts = opts.attempts ?? CATALOG_ATTEMPTS
+  const timeoutMs = opts.timeoutMs ?? CATALOG_TIMEOUT_MS
+  const deadline = Date.now() + (opts.budgetMs ?? CATALOG_TOTAL_BUDGET_MS)
   let lastError: unknown
-  for (let attempt = 1; attempt <= CATALOG_ATTEMPTS; attempt += 1) {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const remaining = deadline - Date.now()
     if (remaining <= 0) break
     try {
       const response = await fetch(url, {
         headers,
-        signal: AbortSignal.timeout(Math.min(CATALOG_TIMEOUT_MS, remaining)),
+        signal: AbortSignal.timeout(Math.min(timeoutMs, remaining)),
       })
       if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`)
       const payload: unknown = await response.json()
@@ -457,7 +473,7 @@ async function fetchJson(url: string, headers: Record<string, string>): Promise<
       return payload
     } catch (error) {
       lastError = error
-      if (attempt < CATALOG_ATTEMPTS) await sleep(250 * attempt)
+      if (attempt < attempts) await sleep(250 * attempt)
     }
   }
   throw lastError
@@ -578,6 +594,10 @@ function buildModels(
  */
 const CACHE_DIR = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'cache')
 const CACHE_PATH = join(CACHE_DIR, `${name}-catalog.json`)
+// The cache file used to be named after the LLM provider id, before the
+// package, bundle, and service names were unified; keep reading it so an
+// existing install's last-good catalog survives the rename.
+const LEGACY_CACHE_PATH = join(CACHE_DIR, 'opencode-zen-free-catalog.json')
 
 interface CatalogCache {
   zen: unknown[]
@@ -585,15 +605,21 @@ interface CatalogCache {
   userAgent: string
 }
 
+const parseCatalogCache = (payload: unknown): CatalogCache | undefined => {
+  if (!isRecord(payload) || !Array.isArray(payload.zen) || !isRecord(payload.models)) return undefined
+  if (typeof payload.userAgent !== 'string') return undefined
+  return { zen: payload.zen, models: payload.models, userAgent: payload.userAgent }
+}
+
 async function readCatalogCache(): Promise<CatalogCache | undefined> {
-  try {
-    const parsed: unknown = JSON.parse(await readFile(CACHE_PATH, 'utf8'))
-    if (!isRecord(parsed) || !Array.isArray(parsed.zen) || !isRecord(parsed.models)) return undefined
-    if (typeof parsed.userAgent !== 'string') return undefined
-    return { zen: parsed.zen, models: parsed.models, userAgent: parsed.userAgent }
-  } catch {
-    return undefined
+  for (const path of [CACHE_PATH, LEGACY_CACHE_PATH]) {
+    try {
+      return parseCatalogCache(JSON.parse(await readFile(path, 'utf8')))
+    } catch {
+      // Try the next path; a cache miss is always recoverable.
+    }
   }
+  return undefined
 }
 
 async function writeCatalogCache(cache: CatalogCache): Promise<void> {
@@ -622,10 +648,13 @@ const PI_AUTH: { credentials: CredentialStore, authContext: AuthContext } = {
 }
 
 export async function apply(ctx: Context, config: LiveConfig): Promise<void> {
-  // One-time: the Zen user-agent the transport forces on every opencode.ai request.
-  const opencodeVersion = await resolveOpenCodeVersion()
-  const opencodeUserAgent = `opencode/${opencodeVersion}`
-  zenUserAgent = opencodeUserAgent
+  // Boot-time work is strictly local. The harness's web server only listens
+  // once every plugin's apply settles, so anything network-bound here would
+  // hold the whole UI hostage on a slow or blocked route. The user agent and
+  // the model list both come from the last-good catalog on disk; the live
+  // refresh runs in the background below.
+  const cached = await readCatalogCache()
+  zenUserAgent = cached?.userAgent ?? `opencode/${OPENCODE_VERSION_FALLBACK}`
 
   // The Loader owns the settings namespace, so the configuration form is
   // addressed by the profile entry id that mounted this plugin.
@@ -634,6 +663,13 @@ export async function apply(ctx: Context, config: LiveConfig): Promise<void> {
   // Outside the settings-backed config, so a settings snapshot cannot clobber
   // a scan.
   let scanned: Model<ZenApi>[] = []
+  if (cached !== undefined) {
+    try {
+      scanned = buildModels(cached.zen, cached.models, cached.userAgent)
+    } catch {
+      scanned = []
+    }
+  }
 
   const buildProfiles = (): ReadonlyMap<string, ResolvedPiAiProviderProfile> => {
     const opts = liveConfig(config)
@@ -691,19 +727,22 @@ export async function apply(ctx: Context, config: LiveConfig): Promise<void> {
 
   // Every field is volatile, so the Loader commits a settings write into this
   // fiber and announces it here instead of remounting; re-derive the profiles.
+  // (Older harnesses without the event simply pick changes up on remount.)
   ctx.on('loader/volatile-update', () => {
     profiles = buildProfiles()
   })
 
-  // The catalog is fetched once at mount. Mount awaits it: dsh resolves a
-  // session's model as soon as the provider is up, so registering the adapter
-  // against an empty catalogue makes every model read as UNKNOWN_MODEL on the
-  // first turn — the scan has to land before the first resolve does. Both
-  // feeds are bounded, and when either is unreachable the last-good catalog
-  // on disk stands in.
-  async function sync(): Promise<void> {
-    const usable = (zen: unknown[], models: Record<string, unknown>, userAgent: string) => {
-      const next = buildModels(zen, models, userAgent)
+  // The background refresh: resolve the current OpenCode version (short,
+  // single-attempt), scan the catalog feeds (bounded), and swap the profiles
+  // map only when the model list actually changed — the new Map identity is
+  // what makes PiAiAdapter rebuild its snapshot, so the picker and new turns
+  // see the refreshed list without any re-registration.
+  const refresh = async (): Promise<void> => {
+    const userAgent = `opencode/${await resolveOpenCodeVersion()}`
+    zenUserAgent = userAgent
+
+    const usable = (zen: unknown[], models: Record<string, unknown>, ua: string) => {
+      const next = buildModels(zen, models, ua)
       if (next.length === 0) throw new Error('no OpenCode Zen free models resolved')
       return next
     }
@@ -711,23 +750,19 @@ export async function apply(ctx: Context, config: LiveConfig): Promise<void> {
     let next: Model<ZenApi>[]
     try {
       const [zen, modelsDev] = await Promise.all([
-        fetchJson(ZEN_CATALOG_URL, {
-          'User-Agent': opencodeUserAgent,
-          accept: 'application/json',
-        }),
+        fetchJson(ZEN_CATALOG_URL, { 'User-Agent': userAgent, accept: 'application/json' }),
         fetchJson('https://models.dev/api.json', { accept: 'application/json' }),
       ])
       if (!Array.isArray(zen.data)) throw new Error('zen models: unexpected response shape')
       if (!isRecord(modelsDev.opencode) || !isRecord(modelsDev.opencode.models)) {
         throw new Error('models.dev: no "opencode" provider')
       }
-      next = usable(zen.data, modelsDev.opencode.models, opencodeUserAgent)
-      void writeCatalogCache({ zen: zen.data, models: modelsDev.opencode.models, userAgent: opencodeUserAgent })
+      next = usable(zen.data, modelsDev.opencode.models, userAgent)
+      void writeCatalogCache({ zen: zen.data, models: modelsDev.opencode.models, userAgent })
     } catch (error) {
-      const cached = await readCatalogCache()
-      if (cached === undefined) throw error
-      ctx.logger.warn('[%s] catalog fetch failed (%s); using the cached catalog', name, errorChain(error))
-      next = usable(cached.zen, cached.models, cached.userAgent)
+      // The cache (if any) is already serving; keep it and say why.
+      ctx.logger.warn('[%s] catalog refresh failed (%s); keeping the current model list', name, errorChain(error))
+      return
     }
 
     if (deepEqualJson(next, scanned)) return
@@ -736,7 +771,16 @@ export async function apply(ctx: Context, config: LiveConfig): Promise<void> {
     ctx.logger.info('[%s] synced %d free model(s): %s', name, scanned.length, scanned.map(model => model.id).join(', '))
   }
 
-  await sync().catch((error: unknown) => {
-    ctx.logger.warn('[%s] initial catalog scan failed: %s', name, errorChain(error))
+  // Cold cache (first ever boot, or the cache file went away): hold the boot
+  // only for a grace window so a healthy network can land the scan before the
+  // first turn — a slow or blocked route proceeds after the window while the
+  // scan keeps running in the background. Warm cache: never block at all.
+  const refreshPromise = refresh().catch((error: unknown) => {
+    ctx.logger.warn('[%s] catalog refresh failed: %s', name, errorChain(error))
   })
+  if (cached === undefined) {
+    await Promise.race([refreshPromise, sleep(FIRST_BOOT_GRACE_MS)])
+  } else {
+    void refreshPromise
+  }
 }
