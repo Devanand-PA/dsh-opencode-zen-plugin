@@ -1,6 +1,7 @@
 # Bundle patch: mounts this package's plugin into every profile that selects
 # the bundle. The id doubles as the settings namespace for the plugin's
-# configuration form.
+# configuration form, and matches the package name so one string identifies
+# the plugin everywhere outside the LLM provider namespace.
 - insert:
-    - id: opencode-zen-free
-      name: dsh-opencode-zen-free
+    - id: dsh-opencode-zen-plugin
+      name: dsh-opencode-zen-plugin

@@ -50,10 +50,16 @@ import { getBuiltinModels } from '@earendil-works/pi-ai/providers/all'
 import { stream as piCompletionsStream, streamSimple as piCompletionsStreamSimple } from '@earendil-works/pi-ai/api/openai-completions'
 import { stream as piResponsesStream, streamSimple as piResponsesStreamSimple } from '@earendil-works/pi-ai/api/openai-responses'
 
-export const name = 'opencode-zen-free'
+// The cordis service name: the plugin's identity inside the harness. It
+// matches the package name, so one string names the plugin everywhere.
+export const name = 'dsh-opencode-zen-plugin'
 export const inject = ['llm']
 
-const PROVIDER = name
+// The LLM provider id: a separate namespace, the one the model picker shows
+// as `opencode-zen-free/<model>` (like `nvidia-nim/z-ai/glm-5.3-flash`).
+// Changing it would strand saved sessions and settings that name a model
+// under this provider, so it stays descriptive of the models it serves.
+const PROVIDER = 'opencode-zen-free'
 const DISPLAY_NAME = 'OpenCode Zen Free'
 
 /**

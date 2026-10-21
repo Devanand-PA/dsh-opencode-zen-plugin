@@ -1,17 +1,21 @@
-# dsh-opencode-zen-free
+# dsh-opencode-zen-plugin
 
 A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin that
 registers [OpenCode Zen](https://opencode.ai/zen)'s **free anonymous models** as an
 LLM provider — no API key required.
 
-> **Naming:** the repository is `dsh-opencode-zen-plugin`; the package you
-> install and the bundle you enable are `dsh-opencode-zen-free`. Package
-> managers key the dependency by the package's own name, so
-> `pnpm add github:Devanand-PA/dsh-opencode-zen-plugin` installs
-> `dsh-opencode-zen-free` — the bundle entry in your profile stays
-> `dsh-opencode-zen-free`.
+One name covers the whole plugin: the repository, the npm package, the profile
+bundle, and the harness service are all `dsh-opencode-zen-plugin`.
+
+The one deliberate exception is the **LLM provider id**, `opencode-zen-free` —
+the namespace the model picker shows as `opencode-zen-free/<model>` (alongside
+`nvidia-nim/z-ai/glm-5.3-flash` and `deepseek-official/<model>`). It names the
+*models being served*, not the plugin doing the serving, and keeping it stable
+means saved sessions and settings that reference a model under this provider
+keep working.
 
 - Provider id: `opencode-zen-free` (display name **OpenCode Zen Free**)
+- Package / bundle / service: `dsh-opencode-zen-plugin`
 - Works on DSH `0.2.1-rc.2` (web + headless profiles)
 - Zero-cost models are discovered live from the Zen catalog + [models.dev](https://models.dev)
   metadata (free = zero cost or a `-free` model id), with a disk cache
@@ -60,15 +64,15 @@ Add the package as a profile dependency and bundle, then install. In
   // …
   "dependencies": {
     // from GitHub:
-    "dsh-opencode-zen-free": "github:Devanand-PA/dsh-opencode-zen-plugin",
+    "dsh-opencode-zen-plugin": "github:Devanand-PA/dsh-opencode-zen-plugin",
     // …or from a local checkout (edit-in-place friendly):
-    // "dsh-opencode-zen-free": "link:/path/to/dsh-opencode-zen-plugin"
+    // "dsh-opencode-zen-plugin": "link:/path/to/dsh-opencode-zen-plugin"
   },
   "dsh": {
     "profile": {
       "bundles": [
         // …existing bundles…,
-        "dsh-opencode-zen-free"
+        "dsh-opencode-zen-plugin"
       ]
     }
   }
@@ -82,7 +86,7 @@ model, pick **OpenCode Zen Free → <model>** in the model picker.
 > The repository ships the compiled `lib/` output, so a GitHub install works
 > without a build step. Cloning and hacking on it? `pnpm install && pnpm build`
 > inside the checkout, then point the profile at it with
-> `"dsh-opencode-zen-free": "link:/path/to/checkout"`.
+> `"dsh-opencode-zen-plugin": "link:/path/to/checkout"`.
 
 To make it the default for new agents, add to the profile's `cordis.patch.yml`:
 
@@ -114,7 +118,7 @@ pnpm typecheck
 ```
 
 Point a profile at the checkout with
-`"dsh-opencode-zen-free": "link:/path/to/dsh-opencode-zen-plugin"` and re-run
+`"dsh-opencode-zen-plugin": "link:/path/to/dsh-opencode-zen-plugin"` and re-run
 `pnpm install` in the profile directory.
 
 ## Optional: a real OpenCode API key
@@ -126,8 +130,8 @@ plugin resolves it per request and falls back to anonymous access when absent.
 
 ## Configuration
 
-`llm.opencode-zen-free` settings section (all volatile; the plugin re-reads on
-change):
+The `dsh-opencode-zen-plugin:` settings section (the bundle's entry id is the
+namespace; all fields are volatile, so the plugin re-reads them on change):
 
 | Setting | Default | Meaning |
 | --- | --- | --- |

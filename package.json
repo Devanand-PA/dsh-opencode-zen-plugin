@@ -1,5 +1,5 @@
 {
-  "name": "dsh-opencode-zen-free",
+  "name": "dsh-opencode-zen-plugin",
   "version": "0.1.0",
   "description": "OpenCode Zen free anonymous models provider for the DeepSeek Harness",
   "type": "module",

@@ -27,7 +27,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { RetryPolicyConfig } from '@deepseek-ai/dsh-llm';
 import z from '@deepseek-ai/schemastery';
 import { type Tool } from '@earendil-works/pi-ai';
-export declare const name = "opencode-zen-free";
+export declare const name = "dsh-opencode-zen-plugin";
 export declare const inject: string[];
 export interface Config {
     /** Base64 image payload one request accepts before older images are offloaded (default 2 MiB). */
