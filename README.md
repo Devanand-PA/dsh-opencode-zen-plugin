@@ -144,7 +144,26 @@ namespace; all fields are volatile, so the plugin re-reads them on change):
 | --- | --- | --- |
 | `maxRequestImageBytes` | 2097152 | Largest image attachment offered to Zen (bytes) |
 | `requestImageMaxBytes` | 1048576 | Images above this are offloaded to text instead |
-| `retryPolicy` | adapter defaults | Retry behaviour for transient Zen failures |
+| `requestTimeoutMs` | 60000 | Deadline for the response **headers** of one request. The timer is cleared the moment the headers arrive, so a long stream is never cut short; a route that silently drops the request fails instead of freezing the turn |
+| `streamIdleTimeoutMs` | 120000 | Maximum silence between two streamed chunks |
+| `retryPolicy` | 2 retries, 1–5s backoff | Retry behaviour for transient Zen failures |
+
+### When a request hangs
+
+The free tier is shared capacity and a dropped route can leave a request open
+forever. Three things keep that bounded:
+
+- `requestTimeoutMs` fails the request when no headers arrive in time.
+- `streamIdleTimeoutMs` fails it when the stream goes silent mid-answer.
+- The plugin's default retry policy allows **two** retries (three attempts in
+  total) instead of the harness default of five, so one dead route cannot
+  turn into half an hour of frozen UI.
+
+Raise `requestTimeoutMs` to `120000`–`180000` if a congested free tier makes
+legitimate requests time out; lower it if you would rather fail fast.
+
+Cancelling a turn (the **Stop** control in the UI) aborts the request
+immediately — the plugin forwards the harness's abort signal to the fetch.
 
 ## The anonymous free-tier gate
 
@@ -198,6 +217,19 @@ Model availability:
 - **DSH 0.2.1-alpha.* prints "skipping profile bundle"** — intentional. The
   plugin is compatible with `0.2.1-rc.2` only; alpha builds are excluded so
   they can never be affected by it.
+- **The UI froze during a Zen turn** — the request never came back. Press
+  **Stop** in the chat (the plugin forwards the harness's abort signal to the
+  fetch, so the request dies at once), or wait for `requestTimeoutMs`. If you
+  have to kill the process, `Ctrl+C` works: the harness force-exits 5 seconds
+  after the interrupt, and the plugin aborts its own in-flight requests while
+  it is disposed. As a last resort, and to catch an orphan left behind by a
+  killed wrapper:
+
+  ```sh
+  pkill -f 'dsh/lib/bin.js'     # the harness processes
+  pkill -f 'npm exec @deepseek-ai/dsh'   # a wrapper that survived them
+  killall -9 node                # everything, if nothing else helps
+  ```
 
 ## Credits
 

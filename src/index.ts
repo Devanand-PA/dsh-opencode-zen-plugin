@@ -111,6 +111,31 @@ const AUTH_ERROR_TYPES = new Set(['AuthError', 'authentication_error', 'invalid_
 const DEFAULT_MAX_REQUEST_IMAGE_BYTES = 2_097_152
 const DEFAULT_REQUEST_IMAGE_MAX_BYTES = 1_048_576
 
+/**
+ * Deadline for the response headers of one model request. The OpenAI SDK
+ * clears this timer the moment the headers arrive, so it bounds the wait for
+ * the first byte and never the length of the stream. Without it a dropped
+ * route leaves the request open until the harness's own idle watchdog fires
+ * (minutes later), which reads as a frozen UI.
+ */
+const DEFAULT_REQUEST_TIMEOUT_MS = 60_000
+
+/** Maximum silence between two streamed chunks. */
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000
+
+/**
+ * The plugin's own retry policy. The harness default retries five times, and
+ * a transport error on the free tier usually means a broken route rather than
+ * a blip, so five attempts turn one dead request into a quarter of an hour
+ * of frozen UI. Two retries keep a genuine blip recoverable while bounding
+ * the worst case to roughly three attempts.
+ */
+const DEFAULT_RETRY_POLICY: RetryPolicyConfig = {
+  mode: 'normal',
+  maxRetries: 2,
+  backoff: { initialDelayMs: 1_000, maxDelayMs: 5_000, jitterRatio: 0.1 },
+}
+
 export interface Config {
   /** Base64 image payload one request accepts before older images are offloaded (default 2 MiB). */
   maxRequestImageBytes?: number
@@ -118,12 +143,27 @@ export interface Config {
   requestImageMaxBytes?: number
   /** Provider-owned model-request retry policy; omission uses normal defaults. */
   retryPolicy?: RetryPolicyConfig
+  /**
+   * Deadline for the response headers of one model request, in milliseconds.
+   * The free tier is shared capacity and a dropped route can leave a request
+   * open forever; this bounds how long a turn may sit without an answer
+   * before the request fails and the harness can move on (or the user can
+   * stop the turn). It bounds the wait for the FIRST byte only — the stream
+   * itself is bounded by `streamIdleTimeoutMs`.
+   */
+  requestTimeoutMs?: number
+  /**
+   * Maximum silence between two streamed chunks, in milliseconds.
+   */
+  streamIdleTimeoutMs?: number
 }
 
 export const Config = z.object({
   maxRequestImageBytes: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MAX_REQUEST_IMAGE_BYTES).volatile(),
   requestImageMaxBytes: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_REQUEST_IMAGE_MAX_BYTES).volatile(),
   retryPolicy: RetryPolicySchema.volatile(),
+  requestTimeoutMs: z.number().step(1).min(1_000).max(30 * 60_000).default(DEFAULT_REQUEST_TIMEOUT_MS).volatile(),
+  streamIdleTimeoutMs: z.number().step(1).min(1_000).max(30 * 60_000).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS).volatile(),
 })
 
 type LiveConfig = Schemastery.TypeT<typeof Config>
@@ -136,7 +176,9 @@ function liveConfig(config: LiveConfig): Config {
   return structuredClone({
     maxRequestImageBytes: config.maxRequestImageBytes.get(),
     requestImageMaxBytes: config.requestImageMaxBytes.get(),
-    retryPolicy: config.retryPolicy.get(),
+    retryPolicy: config.retryPolicy.get() ?? DEFAULT_RETRY_POLICY,
+    requestTimeoutMs: config.requestTimeoutMs.get(),
+    streamIdleTimeoutMs: config.streamIdleTimeoutMs.get(),
   }) as Config
 }
 
@@ -250,7 +292,7 @@ const ZEN_URL_MARKERS = [
   ...(() => { try { return [new URL(ZEN_BASE_URL).host] } catch { return [] } })(),
 ]
 
-const zenFetch: typeof globalThis.fetch = (input, init) => {
+const zenFetch: typeof globalThis.fetch = async (input, init) => {
   const url = typeof input === 'string'
     ? input
     : input instanceof URL ? input.href : input instanceof Request ? input.url : String(input)
@@ -259,7 +301,60 @@ const zenFetch: typeof globalThis.fetch = (input, init) => {
   }
   const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined))
   headers.set('user-agent', zenUserAgent)
-  return zenNativeFetch(input, { ...init, headers })
+  // A request that is still open when the plugin is disposed must not hold
+  // the shutdown open: the harness force-exits after its own grace period, and
+  // a socket that lingers makes even that slower. The controller is composed
+  // with the caller's signal, so a cancelled turn still aborts the request.
+  const controller = new AbortController()
+  const signal = init?.signal == null
+    ? controller.signal
+    : AbortSignal.any([init.signal, controller.signal])
+  trackInFlight(controller)
+  try {
+    const response = await zenNativeFetch(input, { ...init, headers, signal })
+    return response
+  } catch (error) {
+    releaseInFlight(controller)
+    throw error
+  }
+}
+
+/**
+ * Controllers of the Zen requests currently open, with the time they started.
+ * A request stays registered until it fails; a request that succeeded keeps
+ * its controller until the stream ends, so the entry is pruned by age.
+ */
+const inFlightRequests = new Map<AbortController, number>()
+
+/** Entries older than this are streams that ended without an error. */
+const IN_FLIGHT_MAX_AGE_MS = 10 * 60_000
+
+const trackInFlight = (controller: AbortController): void => {
+  const now = Date.now()
+  for (const [tracked, started] of inFlightRequests) {
+    if (now - started > IN_FLIGHT_MAX_AGE_MS) inFlightRequests.delete(tracked)
+  }
+  inFlightRequests.set(controller, now)
+}
+
+const releaseInFlight = (controller: AbortController): void => {
+  inFlightRequests.delete(controller)
+}
+
+/**
+ * Abort every open Zen request. Called when the plugin is disposed, so a
+ * request the upstream never answers cannot keep the harness waiting past
+ * its shutdown grace period.
+ */
+const abortInFlightRequests = (): void => {
+  for (const controller of inFlightRequests.keys()) {
+    try {
+      controller.abort(new Error(`${name}: disposed while a request was in flight`))
+    } catch {
+      // Best effort: an already-aborted controller throws nothing.
+    }
+  }
+  inFlightRequests.clear()
 }
 //#endregion
 
@@ -725,7 +820,12 @@ export function apply(ctx: Context, config: LiveConfig): void {
       provider: PROVIDER,
       displayName: DISPLAY_NAME,
       apiKeyEnv: credentialRef('OPENCODE_ZEN_FREE_API_KEY'),
-      streamIdleTimeoutMs: 300_000,
+      // Bounds the wait for the response headers. The SDK clears this timer
+      // as soon as the headers arrive, so a long stream is never cut short,
+      // while a route that silently drops the request fails in bounded time
+      // instead of freezing the turn.
+      timeoutMs: opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+      streamIdleTimeoutMs: opts.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS,
       maxRequestImageBytes: opts.maxRequestImageBytes ?? DEFAULT_MAX_REQUEST_IMAGE_BYTES,
       requestImagePixelBudget: 4_194_304,
       requestImageMaxBytes: opts.requestImageMaxBytes ?? DEFAULT_REQUEST_IMAGE_MAX_BYTES,
@@ -767,6 +867,16 @@ export function apply(ctx: Context, config: LiveConfig): void {
   ctx.on('loader/volatile-update', () => {
     profiles = buildProfiles()
   })
+
+  // A request the upstream never answers must not hold the shutdown open:
+  // on dispose, every Zen request still in flight is aborted so the harness
+  // can exit inside its own grace period instead of being force-killed.
+  ctx.effect(
+    () => () => {
+      abortInFlightRequests()
+    },
+    `${name}: abort in-flight requests`,
+  )
 
   setImmediate(() => refresh(true))
   const dailyRefresh = setInterval(() => refresh(true), 6 * 60 * 60_000)

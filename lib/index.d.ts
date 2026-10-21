@@ -39,15 +39,32 @@ export interface Config {
     requestImageMaxBytes?: number;
     /** Provider-owned model-request retry policy; omission uses normal defaults. */
     retryPolicy?: RetryPolicyConfig;
+    /**
+     * Deadline for the response headers of one model request, in milliseconds.
+     * The free tier is shared capacity and a dropped route can leave a request
+     * open forever; this bounds how long a turn may sit without an answer
+     * before the request fails and the harness can move on (or the user can
+     * stop the turn). It bounds the wait for the FIRST byte only — the stream
+     * itself is bounded by `streamIdleTimeoutMs`.
+     */
+    requestTimeoutMs?: number;
+    /**
+     * Maximum silence between two streamed chunks, in milliseconds.
+     */
+    streamIdleTimeoutMs?: number;
 }
 export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     maxRequestImageBytes: z<number, number, "volatile-defined">;
     requestImageMaxBytes: z<number, number, "volatile-defined">;
     retryPolicy: z<NoInfer<RetryPolicyConfig>, NoInfer<RetryPolicyConfig>, "volatile">;
+    requestTimeoutMs: z<number, number, "volatile-defined">;
+    streamIdleTimeoutMs: z<number, number, "volatile-defined">;
 }>>, Schemastery.ObjectT<NoInfer<{
     maxRequestImageBytes: z<number, number, "volatile-defined">;
     requestImageMaxBytes: z<number, number, "volatile-defined">;
     retryPolicy: z<NoInfer<RetryPolicyConfig>, NoInfer<RetryPolicyConfig>, "volatile">;
+    requestTimeoutMs: z<number, number, "volatile-defined">;
+    streamIdleTimeoutMs: z<number, number, "volatile-defined">;
 }>>, "plain">;
 type LiveConfig = Schemastery.TypeT<typeof Config>;
 export declare const requiredZenTools: (tools?: readonly Tool[]) => Tool[];
