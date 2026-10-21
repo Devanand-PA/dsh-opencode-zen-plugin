@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2023"],
+    "outDir": "lib",
+    "rootDir": "src",
+    "declaration": true,
+    "declarationMap": false,
+    "sourceMap": false,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": false,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "useDefineForClassFields": true
+  },
+  "include": ["src"]
+}
