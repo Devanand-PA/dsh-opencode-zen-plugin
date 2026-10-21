@@ -27,11 +27,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Devanand-PA/dsh-opencode-zen-free.git"
+    "url": "git+https://github.com/Devanand-PA/dsh-opencode-zen-plugin.git"
   },
-  "homepage": "https://github.com/Devanand-PA/dsh-opencode-zen-free#readme",
+  "homepage": "https://github.com/Devanand-PA/dsh-opencode-zen-plugin#readme",
   "bugs": {
-    "url": "https://github.com/Devanand-PA/dsh-opencode-zen-free/issues"
+    "url": "https://github.com/Devanand-PA/dsh-opencode-zen-plugin/issues"
   },
   "keywords": [
     "dsh",

@@ -4,6 +4,13 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin tha
 registers [OpenCode Zen](https://opencode.ai/zen)'s **free anonymous models** as an
 LLM provider — no API key required.
 
+> **Naming:** the repository is `dsh-opencode-zen-plugin`; the package you
+> install and the bundle you enable are `dsh-opencode-zen-free`. Package
+> managers key the dependency by the package's own name, so
+> `pnpm add github:Devanand-PA/dsh-opencode-zen-plugin` installs
+> `dsh-opencode-zen-free` — the bundle entry in your profile stays
+> `dsh-opencode-zen-free`.
+
 - Provider id: `opencode-zen-free` (display name **OpenCode Zen Free**)
 - Works on DSH `0.2.1-rc.2` (web + headless profiles)
 - Zero-cost models are discovered live from the Zen catalog + [models.dev](https://models.dev)
@@ -37,10 +44,10 @@ Open the DSH Web GUI → **Plugins** → **Install from source**, and enter the
 GitHub URL:
 
 ```
-github:Devanand-PA/dsh-opencode-zen-free
+github:Devanand-PA/dsh-opencode-zen-plugin
 ```
 
-(or `https://github.com/Devanand-PA/dsh-opencode-zen-free.git`). Installation
+(or `https://github.com/Devanand-PA/dsh-opencode-zen-plugin.git`). Installation
 adds the bundle and enables it by default.
 
 ### Option B — profile package.json (from GitHub or a local checkout)
@@ -53,7 +60,7 @@ Add the package as a profile dependency and bundle, then install. In
   // …
   "dependencies": {
     // from GitHub:
-    "dsh-opencode-zen-free": "github:Devanand-PA/dsh-opencode-zen-free",
+    "dsh-opencode-zen-free": "github:Devanand-PA/dsh-opencode-zen-plugin",
     // …or from a local checkout (edit-in-place friendly):
     // "dsh-opencode-zen-free": "link:/path/to/dsh-opencode-zen-plugin"
   },
@@ -99,15 +106,15 @@ with `opencode-zen.yml` containing just the `agent-default-model` patch above
 ### From source (development)
 
 ```bash
-git clone https://github.com/Devanand-PA/dsh-opencode-zen-free.git
-cd dsh-opencode-zen-free
+git clone https://github.com/Devanand-PA/dsh-opencode-zen-plugin.git
+cd dsh-opencode-zen-plugin
 pnpm install
 pnpm build        # tsc → lib/
 pnpm typecheck
 ```
 
 Point a profile at the checkout with
-`"dsh-opencode-zen-free": "link:/path/to/dsh-opencode-zen-free"` and re-run
+`"dsh-opencode-zen-free": "link:/path/to/dsh-opencode-zen-plugin"` and re-run
 `pnpm install` in the profile directory.
 
 ## Optional: a real OpenCode API key
